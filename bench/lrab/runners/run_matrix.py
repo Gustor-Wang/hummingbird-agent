@@ -95,8 +95,23 @@ def main():
             print("Ollama still down, aborting."); sys.exit(2)
     print("Ollama up.", flush=True)
 
-    manifest = {"cells": [], "summary": {}}
+    # process-scoped keep-awake: a multi-hour serial matrix must not be
+    # interrupted by idle sleep/hibernate (2026-08-28: a 2h hibernate killed
+    # a 13-cell batch mid-run). Non-persistent — dies with this process.
+    ka = subprocess.Popen([sys.executable, os.path.join(HERE, "keep_awake.py")],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"keep-awake pid={ka.pid}", flush=True)
+
     attempt_stats = {}
+    manifest = {"cells": [], "summary": {}}
+    try:
+        _run_cells(a, cells, attempt_stats, manifest)
+    finally:
+        ka.terminate()
+        print("keep-awake released.", flush=True)
+
+
+def _run_cells(a, cells, attempt_stats, manifest):
     for ag, md, tk, tp in cells:
         key = f"{ag}:{md}:{tk}"
         if a.start and key < a.start:
@@ -110,7 +125,9 @@ def main():
             if not ollama_up():
                 print("  [probe] ollama down, waiting 60s...", flush=True)
                 wait_ollama(max_wait=60)
-            run_id = f"{ag.replace('-','')}_{tk.replace('-','')}_{md.split(':')[0].replace('-','')}_m{attempt}_{time.strftime('%m%d_%H%M%S')}"
+            # run_id 用完整模型标识(冒号转下划线), 避免 gemma4:12b/e2b 同形(自省P0-3)
+            md_slug = md.replace(':', '_').replace('-', '')
+            run_id = f"{ag.replace('-','')}_{tk.replace('-','')}_{md_slug}_m{attempt}_{time.strftime('%m%d_%H%M%S')}"
             cmd = [sys.executable, os.path.join(HERE, "run_bench.py"),
                    "--agent", ag, "--task", tp, "--model", md,
                    "--results", a.results, "--timeout-min", str(a.timeout_min),
@@ -138,7 +155,7 @@ def main():
         if not ok:
             print(f"  !! cell NOT completed after {a.retries+1} attempts", flush=True)
         attempt_stats[key] = {"attempts": len(cell_attempts), "ok": ok}
-        manifest["cells"].append({"agent": ag, "model": md, "task": tk,
+        manifest.setdefault("cells", []).append({"agent": ag, "model": md, "task": tk,
                                   "attempts": cell_attempts, "ok": ok})
 
     manifest["summary"] = {
