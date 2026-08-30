@@ -24,7 +24,8 @@ jobs:
       - name: Run unit tests
         shell: bash
         run: |
-          python -m pytest tests/ -q -ra --tb=short > pytest_out.txt 2>&1 || true
+          rc=0
+          python -m pytest tests/ -q -ra --tb=short > pytest_out.txt 2>&1 || rc=$?
           cat pytest_out.txt
           {
             echo "### pytest output (${{ matrix.python-version }})"
@@ -32,7 +33,7 @@ jobs:
             cat pytest_out.txt
             echo '</pre>'
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -3 pytest_out.txt | grep -Eq "[0-9]+ passed" || exit 1
+          exit $rc
       - name: Syntax check core modules
         run: |
           python -m py_compile ollama_agent.py
