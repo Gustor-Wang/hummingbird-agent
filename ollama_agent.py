@@ -29,7 +29,7 @@ try:
 except Exception:
     pass
 
-AGENT_HOME = os.path.expanduser("~/.ollama_agent")
+AGENT_HOME = os.environ.get("HUMMINGBIRD_HOME") or os.path.expanduser("~/.ollama_agent")
 MEMORY_FILE = os.path.join(AGENT_HOME, "memory.json")
 SESSIONS_DIR = os.path.join(AGENT_HOME, "sessions")
 SKILLS_DIR_HOME = os.path.join(AGENT_HOME, "skills")
@@ -279,6 +279,7 @@ def tools_for_categories(cats, active=None, extra=None):
         names.update(_CATEGORY_TOOLS.get(c, []))
     if extra:
         names.update(extra)
+    names -= _disabled_tools   # 被禁用的工具不再装配(否则每轮按类别还原)
     active_names = {t["function"]["name"] for t in active}
     for n in names:
         if n in avail and n not in active_names:
@@ -769,6 +770,9 @@ def _resolve_mcp_paths(args, workdir):
 
 # ---------------- 工具执行 ----------------
 _active_tools = list(CORE_TOOLS)
+# 被禁用的工具名:tools_for_categories 每轮按类别重新装配,只过滤 _active_tools 的
+# "禁用"会被下一轮装配还原(潜伏 bug)——持久禁用必须进本集合,装配与调用双处拦截。
+_disabled_tools = set()
 def active_tool_defs():
     return list(_active_tools)
 def enable_advanced_tools(names):
@@ -966,6 +970,18 @@ def _gate_check(name, args, workdir):
 
 def run_tool(name, args, workdir):
     try:
+        # 工具名别名:小模型常输出业界通名(write_file/list_directory 等),
+        # 自动映射到蜂鸟内置工具,而非拒绝("工具已禁用"会让小模型陷入死循环)。
+        _TOOL_ALIASES = {
+            "write_file": "create_file", "save_file": "create_file",
+            "read_text_file": "read_file", "cat": "read_file",
+            "list_directory": "list_dir", "ls": "list_dir",
+            "append_to_file": "append_file", "edit": "edit_file",
+            "search_code": "search_files", "grep": "search_files",
+            "delete": "delete_file", "bash": "run_bash", "shell": "run_bash",
+        }
+        if name in _TOOL_ALIASES:
+            name = _TOOL_ALIASES[name]
         gate = _gate_check(name, args, workdir)
         if gate:
             return gate
@@ -1068,7 +1084,14 @@ def run_tool(name, args, workdir):
         if name=="todo":
             act = args.get("action","list")
             if act=="create":
-                save_todo(workdir,[{"item":i,"done":False} for i in args.get("items",[])])
+                # 参数宽容:小模型常用 plan/steps/items 等别名,或传整个字符串。
+                items = args.get("items") or args.get("plan") or args.get("steps") or []
+                if isinstance(items, str):
+                    items = [ln.strip(" -0123456789.") for ln in items.splitlines() if ln.strip()]
+                items = [str(i) for i in items if str(i).strip()]
+                if not items:
+                    return "[todo create: no items found. Pass items as a list of strings, e.g. items=[\"step 1\", \"step 2\"]]"
+                save_todo(workdir,[{"item":i,"done":False} for i in items])
                 return load_todo_str(workdir)
             if act=="update":
                 t=load_todo(workdir)
@@ -1334,15 +1357,31 @@ _FAIL_MARKERS = ("[edit failed", "[tool error", "[not found", "[web_search error
                  "did not match", "fatal:", "unknown option")
 _TASK_HINTS = ("写","建","改","创建","修改","删","删除","运行","执行","实现","编写","重构","修复",
                "生成","统计","翻译","总结","对比","测试","调试","安装","下载","部署","搭建","配置",
-               "启动","停止","整理","转换","爬取","优化","检查","分析","设计","代码","程序","脚本","帮我做")
+               "启动","停止","整理","转换","爬取","优化","检查","分析","设计","代码","程序","脚本","帮我做",
+               # English imperative/task verbs (benchmark + international users)
+               "write ", "create ", "build ", "implement", "fix ", "debug", "analyze", "analyse",
+               "clean ", "optimize", "optimise", "refactor", "generate", "design ", "audit ",
+               "review ", "compute", "convert", "export", "import ", "plot ", "profile ",
+               "implement ", "produce ", "research ", "search for", "find all", "list all",
+               "step 1", "required steps", "plan at least", "todo(action")
 _QA_HINTS = ("什么","怎么","为什么","如何","解释","说明","介绍","区别","原理","能否","可以吗","能不能",
-             "吗","呢","?","？","你好","hi","hello","在吗","谢谢","再见","早安","晚安","你是谁")
+             "吗","呢","?","？","你好","hi","hello","在吗","谢谢","再见","早安","晚安","你是谁",
+             # English question patterns
+             "what is ", "what are ", "how do i", "how does ", "why is ", "why does ",
+             "can you explain", "tell me about", "who is ", "when was ")
 _MUTATE = ("create_file","edit_file","append_file","delete_file","run_bash")
+
+def _hint_hit(hint, low):
+    """提示词命中:中文/含非 ASCII 用子串;纯 ASCII 用词边界(防 "hi" 命中 "this"、
+    "fix" 命中 "prefix" 这类子串误伤)。大小写由调用方统一 lower。"""
+    if not hint.isascii():
+        return hint in low
+    return re.search(r"\b" + re.escape(hint.strip()) + r"\b", low) is not None
 
 def _is_qa(messages):
     """判断最近一条用户消息是"问答"(问句/寒暄)还是"任务"(要动手干活)。
     问答 → 回答一次即收尾,拦写文件/跑命令;任务 → 正常用工具,绝不强制收尾。
-    跳过 harness 注入的消息,只认真正的用户输入。"""
+    跳过 harness 注入的消息,只认真正的用户输入。大小写不敏感(英文任务常以大写开头)。"""
     for m in reversed(messages):
         if m.get("role") == "user":
             text = str(m.get("content","") or "").strip()
@@ -1351,11 +1390,12 @@ def _is_qa(messages):
             if (text.startswith("⚠️") or text.startswith("Continue:") or text.startswith("[已拦截")
                     or "[先前上下文摘要]" in text or "上下文已压缩" in text):
                 continue
+            low = text.lower()
             # 任务词命中 → 任务(优先,避免把"帮我写代码"当问答)
-            if any(h in text for h in _TASK_HINTS):
+            if any(_hint_hit(h, low) for h in _TASK_HINTS):
                 return False
             # 问句/寒暄命中 → 问答
-            if any(h in text for h in _QA_HINTS):
+            if any(_hint_hit(h, low) for h in _QA_HINTS):
                 return True
             # 短消息(≤40字)无动作词 → 问答
             if len(text) <= 40:
@@ -1452,6 +1492,42 @@ def try_parse_tool_calls(content):
                 calls.append((name, v))
     return calls or None
 
+_ARTIFACT_EXTS = (".md", ".txt", ".png", ".jpg", ".jpeg", ".csv", ".py", ".json", ".docx",
+                  ".xlsx", ".pdf", ".html", ".yaml", ".yml", ".svg", ".tex", ".tsv", ".log")
+_FILE_TOKEN = re.compile(r"[A-Za-z0-9_\-一-鿿][A-Za-z0-9_\-一-鿿]*\.[A-Za-z0-9]{2,5}")
+
+def _model_params_b(model):
+    """从模型名解析参数量(单位:B): gemma4:e2b→2.0 / qwen3.5:4b→4.0 / ornith-1.5:35b→35.0。
+    解析失败返回 None(调用方按大模型处理)。"""
+    m = re.search(r"(\d+(?:\.\d+)?)b\b", str(model).lower())
+    return float(m.group(1)) if m else None
+
+def _claimed_missing_files(summary, workdir):
+    """finish 产物核对:提取 summary 声称的文件名,返回工作目录中不存在的。
+    判定存在:按声称路径(相对 workdir)查 → 按文件名递归搜 → 现有文件名是 token
+    后缀也算(兼容中文动词前缀粘连,如"生成了温度分布图.png")。"""
+    toks = set()
+    for m in _FILE_TOKEN.finditer(summary or ""):
+        tok = m.group(0).strip()
+        if tok.lower().endswith(_ARTIFACT_EXTS):
+            toks.add(tok)
+    if not toks:
+        return []
+    all_bn = [os.path.basename(f).lower()
+              for f in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
+              if os.path.isfile(f)]
+    missing = []
+    for tok in sorted(toks):
+        rel = tok.replace("\\", "/").lstrip("./")
+        if os.path.isfile(os.path.join(workdir, rel)):
+            continue
+        base = os.path.basename(rel).lower()
+        if base in all_bn or any(base.endswith(bn) for bn in all_bn):
+            continue
+        missing.append(tok)
+    return missing
+
+
 def agent_loop(model, messages, workdir, session):
     global _active_tools
     fails = 0
@@ -1469,6 +1545,8 @@ def agent_loop(model, messages, workdir, session):
     _PRODUCTIVE = ("create_file", "edit_file", "append_file", "finish", "run_bash")
     productive_used = False  # 是否调用过产出型工具
     fake_finish_warns = 0
+    finish_claim_warns = 0   # finish 产物核对拒绝次数(≥2 放行,防死锁)
+    bash_teach_warns = 0     # 小模型 run_bash 教学提示次数
     empty_turns = 0          # 连续空文本输出计数
     test_guard_warns = 0
     qa = _is_qa(messages)          # 用户最近消息是"问答"还是"任务"
@@ -1488,6 +1566,12 @@ def agent_loop(model, messages, workdir, session):
                                ("⚠️", "Continue:", "[已拦截", "回答已经足够"))), "")
         cats = route_categories(_task_text)
         mcp_manifest()   # 预热 MCP 探测缓存(实际工具由 tools_for_categories 扁平并入)
+    # 小模型协议降级(≤4B):edit_file 的 old_text 精确匹配是 2-4B 模型失败重灾区,
+    # 直接持久禁用,一律用 create_file 重写;run_bash 报错附教学提示(见错误处理段)。
+    # 模型名解析参数量: gemma4:e2b→2 / qwen3.5:4b→4 / ornith-1.5:35b→35;解析失败视为大模型。
+    _small_model = (not qa) and ((_model_params_b(model) or 99.0) <= 4.0)
+    if _small_model:
+        _disabled_tools.add("edit_file")
     allowed_extra = set()   # 模型 enable_tools 补充的工具名
     _compact_lvl = 0        # 已执行的最高压缩级别(避免同级别重复触发)
     _restarts = 0           # ollama 重启次数(单任务上限 3 次,防无限重启)
@@ -1635,7 +1719,18 @@ def agent_loop(model, messages, workdir, session):
                     except: args={}
                 # 禁用工具必须拒绝执行(模型可能幻觉调用已被禁用的工具)
                 # MCP 扁平工具("服务器.工具名")不在 _active_tools 里,需放行(run_tool 会路由)
-                if name not in [t["function"]["name"] for t in _active_tools] and not is_mcp_tool(name):
+                # 别名优先:write_file/list_directory 等业界通名映射为内置工具,直接放行
+                _alias = {"write_file": "create_file", "save_file": "create_file",
+                          "read_text_file": "read_file", "cat": "read_file",
+                          "list_directory": "list_dir", "ls": "list_dir",
+                          "append_to_file": "append_file", "edit": "edit_file",
+                          "search_code": "search_files", "grep": "search_files",
+                          "delete": "delete_file", "bash": "run_bash", "shell": "run_bash"}
+                if name in _alias:
+                    print(f"[{i}] ⚡ 别名映射: {name} -> {_alias[name]}", flush=True)
+                    name = _alias[name]
+                    fn["name"] = name
+                if (name in _disabled_tools or name not in [t["function"]["name"] for t in _active_tools]) and not is_mcp_tool(name):
                     res = f"[tool {name} 已被禁用,请改用其他工具;若是搜索/抓取请直接写报告]"
                 elif name not in ("finish", "todo") and last_sig == (name, json.dumps(args, sort_keys=True, ensure_ascii=False)) and dup_warns < 3:
                     # 严格不重复同一命令:完全相同签名连续调用 → 拦截并提醒换策略
@@ -1643,6 +1738,10 @@ def agent_loop(model, messages, workdir, session):
                     res = f"[已拦截:你刚调用过完全相同的 {name}(参数一致),结果不会变。请换策略:read_file 看真实情况/换实现方式。]"
                     print(f"[{i}] ⚠️ 重复调用拦截: {name}({dup_warns})", flush=True)
                     messages.append({"role":"tool","content":res})
+                    # 拦截立刻前置提醒:tool 消息对小模型注意力弱,用 user 消息钉住"别原样重试"
+                    messages.append({"role":"user","content":
+                        "⚠️ 上一次调用被判定为重复(与此前完全一致),结果不会变。"
+                        "不要原样重试:先用 read_file/list_dir 确认现状,或换一种实现方式继续推进。"})
                     continue
                 elif qa and name in _MUTATE and casual_warns < 3:
                     # 问答守护:用户是问句/寒暄,拦住写文件/跑命令这类"加戏"
@@ -1704,15 +1803,38 @@ def agent_loop(model, messages, workdir, session):
                                 f"运行 python -m pytest -q 确认全绿后再 finish。"})
                             messages.append({"role":"tool","content":res})
                             continue
+                    # 产物核对门禁:finish summary 声称的产物逐一对照 workdir,缺失则拒绝。
+                    # (裸 finish 曾让模型谎报"已写入/已生成"直接收货——谎报是低分直接死因)
+                    if not qa and finish_claim_warns < 2:
+                        _missing = _claimed_missing_files(str(args.get("summary","")), workdir)
+                        if _missing:
+                            finish_claim_warns += 1
+                            print(f"[{i}] ⚠️ 产物核对:summary 声称但缺失 {_missing},拒绝 finish", flush=True)
+                            messages.append({"role":"user","content":
+                                "⚠️ 你的 finish 被拒绝:summary 声称的以下产物在工作目录中不存在:\n"
+                                + "\n".join("- " + f for f in _missing)
+                                + "\n请用 create_file/run_bash 真正生成它们;"
+                                "或修改 summary 只声称确实存在的文件,然后重新 finish。"})
+                            messages.append({"role":"tool","content":res})
+                            continue
                     print("\n===== TASK COMPLETE =====", flush=True); print(res, flush=True)
                     save_session(session, messages)
                     return messages
                 # 重复失败检测:同工具连续失败(只有同工具成功才清零)→ 强制换策略/禁用
                 if _is_tool_error(res):
+                    # 小模型教学:把 Python 代码直接喂给 cmd 是 e2b 的头号浪费
+                    # ('import' is not recognized)——首次命中即教正确姿势,最多 2 次
+                    if _small_model and name == "run_bash" \
+                            and "not recognized" in res.lower() and bash_teach_warns < 2:
+                        bash_teach_warns += 1
+                        messages.append({"role":"user","content":
+                            "提示:run_bash 执行的是 Windows shell 命令(cmd),不能直接运行 Python 代码。"
+                            "正确做法:先用 create_file 把代码写入 .py 文件,再用 run_bash 运行:python 文件名.py"})
                     fail_count[name] = fail_count.get(name, 0) + 1
                     if fail_count[name] >= 3:
                         if name == "edit_file":
                             # edit_file 是小模型最易卡死的工具:连续 3 次失败直接禁用,强推 create_file
+                            _disabled_tools.add("edit_file")
                             _active_tools = [t for t in _active_tools
                                              if t["function"]["name"] != "edit_file"]
                             messages.append({"role":"user","content":
@@ -1744,6 +1866,7 @@ def agent_loop(model, messages, workdir, session):
                     tool_streak = 1
                 if tool_streak >= 8 and name != "finish":
                     # 强升级:任何工具连续 8 次 → 临时禁用,强制推进(todo/搜索/只读循环都适用)
+                    _disabled_tools.add(name)
                     _active_tools = [t for t in _active_tools
                                      if t["function"]["name"] != name]
                     messages.append({"role":"user","content":
@@ -1754,6 +1877,7 @@ def agent_loop(model, messages, workdir, session):
                     research_streak += 1
                     if research_streak >= 6 and research_warns < 3:
                         research_warns += 1
+                        _disabled_tools.update(_RESEARCH)
                         _active_tools = [t for t in _active_tools
                                          if t["function"]["name"] not in _RESEARCH]
                         messages.append({"role":"user","content":
@@ -1766,6 +1890,7 @@ def agent_loop(model, messages, workdir, session):
                 if name == "todo":
                     todo_streak += 1
                     if todo_streak >= 6:
+                        _disabled_tools.add("todo")
                         _active_tools = [t for t in _active_tools
                                          if t["function"]["name"] != "todo"]
                         messages.append({"role":"user","content":
