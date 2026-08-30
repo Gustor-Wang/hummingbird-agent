@@ -1,0 +1,9 @@
+{
+  "patterns": [
+    "hummingbird_LH01_*_0830_*",
+    "hummingbird_LH02_*_0830_*",
+    "hummingbird_LH03_*_0830_*"
+  ],
+  "target": 12,
+  "note": "LRAB-H hummingbird wave launched 2026-08-30 ~09:40 (LH-01/02/03 x 4 models, 90min budget, LH-03 kill-resume at 50%). Plan: competitor waves (opencode/agent-mini/goose, same 12-cell shape) after this block completes. Compare vs WF-64-layer behavior; LH-03 resume meta lives in score.json 'resume'."
+}
