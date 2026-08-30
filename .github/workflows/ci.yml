@@ -22,7 +22,17 @@ jobs:
           pip install pytest
           pip install requests beautifulsoup4
       - name: Run unit tests
-        run: python -m pytest tests/ -q
+        shell: bash
+        run: |
+          python -m pytest tests/ -q -ra --tb=short > pytest_out.txt 2>&1 || true
+          cat pytest_out.txt
+          {
+            echo "### pytest output (${{ matrix.python-version }})"
+            echo '<pre>'
+            cat pytest_out.txt
+            echo '</pre>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -3 pytest_out.txt | grep -Eq "[0-9]+ passed" || exit 1
       - name: Syntax check core modules
         run: |
           python -m py_compile ollama_agent.py
